@@ -376,14 +376,13 @@ export class PrismaExperimentRepository extends ExperimentRepository {
         return this.staleWorkbenchWrite(transaction, input.projectId, row.id);
       }
       const nextVersion = row.workbenchVersion + 1;
-      // SQL, not updateMany: updateMany puts the filter in a subquery, and a racing
-      // writer parked on the row lock re-checks only the id, so both would win.
+      /** SQL, so the version fence sits on the row: `updateMany` re-checks only the id. */
       const updated = await transaction.$executeRaw`
         UPDATE "Experiment"
            SET "name" = ${input.name},
                "workbenchState" = ${JSON.stringify(input.state)}::jsonb,
                "workbenchVersion" = ${nextVersion},
-               "updatedAt" = now()
+               "updatedAt" = (now() AT TIME ZONE 'UTC')
          WHERE "id" = ${row.id}
            AND "projectId" = ${input.projectId}
            AND "archivedAt" IS NULL
@@ -540,6 +539,18 @@ export class PrismaExperimentRepository extends ExperimentRepository {
       orderBy: { counterVersion: "desc" },
       take: input.take,
     });
+  }
+
+  async hasWorkbenchVersionOfRun(input: {
+    projectId: string;
+    experimentId: string;
+    runId: string;
+  }): Promise<boolean> {
+    const found = await this.database.experimentVersion.findFirst({
+      where: { projectId: input.projectId, experimentId: input.experimentId, runId: input.runId },
+      select: { id: true },
+    });
+    return found !== null;
   }
 
   async findWorkbenchVersion(input: {
