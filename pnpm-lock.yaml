@@ -3600,6 +3600,9 @@ importers:
       '@langwatch/handled-error':
         specifier: workspace:*
         version: link:../../../../packages/handled-error
+      '@langwatch/identity-contract':
+        specifier: workspace:*
+        version: link:../../../../modules/identity/contract
       '@langwatch/kernel':
         specifier: workspace:*
         version: link:../../../../packages/kernel
@@ -3661,6 +3664,9 @@ importers:
       '@langwatch/kernel':
         specifier: workspace:*
         version: link:../../../../packages/kernel
+      '@langwatch/ksuid':
+        specifier: workspace:*
+        version: link:../../../../packages/ksuid
       '@langwatch/observability':
         specifier: workspace:*
         version: link:../../../../packages/observability
@@ -7109,6 +7115,9 @@ importers:
       '@langwatch/automation-contract':
         specifier: workspace:*
         version: link:../../automation/contract
+      '@langwatch/clickhouse-client':
+        specifier: workspace:*
+        version: link:../../../packages/clickhouse-client
       '@langwatch/config':
         specifier: workspace:*
         version: link:../../../packages/config
@@ -10884,6 +10893,9 @@ importers:
       '@langwatch/dashboard-contract':
         specifier: workspace:*
         version: link:../../dashboard/contract
+      '@langwatch/data-retention-contract':
+        specifier: workspace:*
+        version: link:../../data-retention/contract
       '@langwatch/dataset-contract':
         specifier: workspace:*
         version: link:../../dataset/contract

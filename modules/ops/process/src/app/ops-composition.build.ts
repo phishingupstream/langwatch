@@ -8,11 +8,7 @@ import {
   replayLeanOf,
   replayProjectionsOf,
 } from "@langwatch/eventing";
-import {
-  EventingClickHouseReplayEventSource,
-  type EventingClickHouseReplayClient,
-  type EventingClickHouseStreamingQueryResult,
-} from "@langwatch/eventing/server";
+import { EventingClickHouseReplayEventSource } from "@langwatch/eventing/server";
 /**
  * Builds the {@link OpsAppInfrastructure} `apps/api/src/features/ops/ops.composition.ts`
  * (deleted by b383462d96) used to hand-compose. Answers each api-unavailable
@@ -37,7 +33,6 @@ import type { Cluster, Redis as IORedis } from "ioredis";
 import type { AnomalyRateTrackerRepository } from "../repositories/anomaly.repository.ts";
 import { NullBlobStoreRepository } from "../repositories/blob-store.repository.ts";
 import { EventExplorerClickHouseRepository } from "../repositories/clickhouse/clickhouse.event-explorer.repository.ts";
-import type { EventExplorerClickHouseClient } from "../repositories/clickhouse/clickhouse.event-explorer.repository.ts";
 import { OpsClickHouseRuntime } from "../repositories/clickhouse/clickhouse.ops-explain.repository.ts";
 import { OpsQueueMetricsSourceRepository } from "../repositories/ops-queue-metrics-source.repository.ts";
 import { PrismaAdminBackofficeRepository } from "../repositories/prisma/prisma.admin-backoffice.repository.ts";
@@ -77,6 +72,7 @@ import { DefaultOpsSnapshotService } from "../services/ops-snapshot-reader.servi
 import { OpsService } from "../services/ops.service.ts";
 import { QueueAuditService } from "../services/queue-audit.service.ts";
 import { QueueService } from "../services/queue.service.ts";
+import { ReplayRetentionService } from "../services/replay-retention.service.ts";
 import { ReplayService } from "../services/replay.service.ts";
 import { SchedulerOpsService } from "../services/scheduler-ops.service.ts";
 import type {
@@ -116,17 +112,20 @@ export type OpsProcessMembers = Readonly<{
 }>;
 
 /**
- * One replay run's engine over the pipelines this process registered: the event log through the
- * routed member, markers on its own standalone Redis connection, so a rebuild shares no socket
- * with live traffic. A Cluster refuses replay's multi-key operations (CROSSSLOT), as on main.
+ * One replay run's engine over the pipelines this process registered: the event log read through
+ * the routed member itself (§7), markers on a standalone Redis connection sharing no socket with
+ * live traffic. A Cluster refuses replay's multi-key operations (CROSSSLOT), as on main.
  */
 class OpsReplayRuntimes implements OpsReplayRuntimeFactory {
   constructor(
-    private readonly members: Pick<OpsProcessMembers, "redis" | "clickhouse" | "eventing">,
+    private readonly input: Readonly<{
+      members: Pick<OpsProcessMembers, "redis" | "clickhouse" | "eventing">;
+      retention: OpsAppDependencies["retention"];
+    }>,
   ) {}
 
   create(): OpsReplayRuntime {
-    const { redis, clickhouse, eventing } = this.members;
+    const { redis, clickhouse, eventing } = this.input.members;
     if (redis.isCluster) {
       throw new Error(
         "Replay requires a standalone Redis: a Cluster refuses its multi-key operations.",
@@ -136,11 +135,11 @@ class OpsReplayRuntimes implements OpsReplayRuntimeFactory {
     const definitions = eventing.definitions;
     const service = new EventingReplayService({
       eventSource: new EventingClickHouseReplayEventSource({
-        resolveClient: (tenantId) =>
-          Promise.resolve(new RoutedReplayClickHouseClient({ clickhouse, tenantId })),
+        clickhouse,
         lean: replayLeanOf(definitions),
       }),
       redis: connection,
+      retentionPolicyResolver: ReplayRetentionService.create(this.input.retention),
     });
     return {
       service,
@@ -150,52 +149,6 @@ class OpsReplayRuntimes implements OpsReplayRuntimeFactory {
       },
     };
   }
-}
-
-/** What replay's discovery across all tenants names in place of one; it reads the shared server. */
-const REPLAY_ALL_TENANTS = "default";
-
-/**
- * Replay's reads over the routed member. The member answers whole result sets, so a batch's
- * "stream" is its one materialized page; statements naming no tenant read the shared server.
- */
-class RoutedReplayClickHouseClient implements EventingClickHouseReplayClient {
-  private readonly clickhouse: ClickHouseQueryClient;
-  private readonly tenantId: string;
-
-  constructor(input: { clickhouse: ClickHouseQueryClient; tenantId: string }) {
-    this.clickhouse = input.clickhouse;
-    this.tenantId = input.tenantId === REPLAY_ALL_TENANTS ? "" : input.tenantId;
-  }
-
-  query = (request: {
-    query: string;
-    query_params?: Record<string, unknown>;
-    format: "JSONEachRow";
-    unscoped?: { reason: string };
-  }): Promise<EventingClickHouseStreamingQueryResult> => {
-    const statement = {
-      tenantId: this.tenantId,
-      sql: request.query,
-      ...(request.query_params ? { params: request.query_params } : {}),
-      ...(request.unscoped ? { unscoped: request.unscoped } : {}),
-    };
-    const rowsOf = <Row>() => this.clickhouse.query<Row>(statement).then((result) => result.rows);
-    return Promise.resolve({ json: rowsOf, stream: <Row>() => oneBatch(rowsOf<Row>()) });
-  };
-
-  async command(request: { query: string; query_params?: Record<string, unknown> }): Promise<void> {
-    await this.clickhouse.command({
-      tenantId: this.tenantId,
-      sql: request.query,
-      ...(request.query_params ? { params: request.query_params } : {}),
-      unscoped: { reason: "Replay's post-rebuild OPTIMIZE TABLE names a table, not a tenant." },
-    });
-  }
-}
-
-async function* oneBatch<Row>(rows: Promise<Row[]>): AsyncIterable<Row[]> {
-  yield await rows;
 }
 
 /** The writer's queue reads over the queue service alone, for a process with no Postgres. */
@@ -229,32 +182,6 @@ class QueueOpsMetricsSource extends OpsQueueMetricsSourceRepository {
     maxTenants: number;
   }): Promise<OpsParkedTenantsPage> {
     return this.queues.listParkedTenants(input);
-  }
-}
-
-/**
- * Adapts the routed ClickHouse client to the event explorer's driver-shaped
- * interface. A named `tenantId` routes to that tenant; an `unscoped` call
- * routes to the shared server (`tenantId: ""`, see `routingDriver.ts`).
- */
-class RoutedEventExplorerClickHouseClient implements EventExplorerClickHouseClient {
-  constructor(private readonly clickhouse: ClickHouseQueryClient) {}
-
-  async query(input: {
-    query: string;
-    query_params?: Record<string, unknown>;
-    format: "JSONEachRow";
-    unscoped?: { reason: string };
-  }): Promise<{ json(): Promise<unknown> }> {
-    const namedTenantId = input.query_params?.tenantId;
-    const tenantId = typeof namedTenantId === "string" ? namedTenantId : "";
-    const result = await this.clickhouse.query({
-      tenantId,
-      sql: input.query,
-      ...(input.query_params ? { params: input.query_params } : {}),
-      ...(input.unscoped ? { unscoped: input.unscoped } : {}),
-    });
-    return { json: async () => result.rows };
   }
 }
 
@@ -365,9 +292,7 @@ export function buildOpsInfrastructure(input: {
         },
         explorers: {
           eventExplorer: EventExplorerService.create({
-            repo: EventExplorerClickHouseRepository.create({
-              client: new RoutedEventExplorerClickHouseClient(members.clickhouse),
-            }),
+            repo: EventExplorerClickHouseRepository.create({ clickhouse: members.clickhouse }),
             introspection,
           }) satisfies OpsEventExplorer,
           managerExplorer: ManagerExplorerService.create({
@@ -383,7 +308,10 @@ export function buildOpsInfrastructure(input: {
           // `ops_projection_replay` builds a runtime and executes.
           replay: ReplayService.create({
             repo: ReplayRedisRepository.create({ redis: members.redis }),
-            runtimeFactory: new OpsReplayRuntimes(members),
+            runtimeFactory: new OpsReplayRuntimes({
+              members,
+              retention: dependencies.retention,
+            }),
           }),
           // Read-only here: the worker holds the lease and writes the
           // artifact; a second writer would publish a second answer.
@@ -405,6 +333,7 @@ export function buildOpsInfrastructure(input: {
         database: members.prisma,
         redis: members.redis,
         isSaaS: () => members.isSaas,
+        routes: () => members.clickhouse.privateRoutes(),
         dependencies,
         passRequests,
       }),
